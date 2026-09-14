@@ -56,6 +56,17 @@ Image minimizers:
 These only minify — they never change an image's format or name; see
 [Images](#images).
 
+Transport encodings:
+
+- `zlib` and anything shaped like it — `MinimizerPlugin.compress`. Compresses an
+  asset so a server can serve it under `Content-Encoding`. Takes `algorithm` — a
+  `zlib` function's name (`gzip`, `brotliCompress`, `deflate`, `zstdCompress`, …)
+  or one of your own — and `compressionOptions` for it, and needs no extra
+  dependency. Give it to [`minify`](#minify) to compress an asset **in place**,
+  or to [`generate`](#generate) as an `asset` generator to write the compressed
+  file **beside** the original; either way it puts itself after the minimizers,
+  through a `getStage` of its own.
+
 All of the non-default minimizers are declared as **optional** peer
 dependencies — install only the ones you actually use. One plugin instance
 covers several languages at once: give [`minify`](#minify) an array and each
@@ -560,6 +571,22 @@ minify.getTypes = () => ["javascript"];
 // dispatched to declares it, since one that does not could not read the bytes.
 minify.supportsBinary = () => true;
 
+// Declare this when the minimizer has to run somewhere other than where
+// minification does — it is handed the `Compilation` class so it can name a
+// stage rather than a number. Each minimizer runs where it asks, chaining
+// through the asset a later one reads back; one asking for nothing runs where
+// minifying belongs.
+minify.getStage = (compilation) =>
+  compilation.PROCESS_ASSETS_STAGE_OPTIMIZE_TRANSFER;
+
+// The name this function's work goes under: the asset it writes is marked
+// with it in the asset info, and stats print it. A minimizer declaring
+// nothing minified the asset, so `minimized`; a generator declaring nothing
+// wrote a new file, so `generated`. It is also what is not run twice — an
+// asset already marked with every name a function writes is declined, which
+// is how one minified by a child compilation is left alone.
+minify.getAssetFlag = () => "compressed";
+
 module.exports = {
   optimization: {
     minimize: true,
@@ -849,6 +876,104 @@ photo.webp    generated beside it
 `filename`, `filter` and `deleteOriginalAssets` describe a file being written
 beside another, so they belong to `"asset"` and setting one on an `"import"`
 generator is an error rather than a field that quietly does nothing.
+
+**When** a generator runs is not among them, because it is not the config's to
+say: the implementation declares it through a `getStage` of its own, the way it
+declares everything else about itself — see [`minify`](#minify). Compressing has
+to read the bytes a user downloads, so `MinimizerPlugin.compress` asks for
+`PROCESS_ASSETS_STAGE_OPTIMIZE_TRANSFER` and runs after every minimizer has had
+its say; one that asks for nothing runs where minifying does. The **name its
+work goes under** is the implementation's too, through the same kind of helper:
+a generator declaring nothing wrote a new file, so `generated`, while `compress`
+says `compressed`, another encoding of the bytes being no smaller a version of
+them. Whatever the name, stats print it and the generator declines a file
+already carrying it, so nothing reads its own output back.
+
+`MinimizerPlugin.compress` ships with the plugin and is written against that.
+`algorithm` says which compression to run — a `zlib` function's name, or one of
+your own taking `(input, options, callback)` — and `compressionOptions` is what
+that algorithm is run with, the way `terserMinify` takes terser's own options.
+Here it is as an `asset` generator, which writes the compressed file beside the
+one it read, so both survive and the URL says which is which:
+
+```js
+const MinimizerPlugin = require("minimizer-webpack-plugin");
+
+module.exports = {
+  optimization: {
+    minimize: true,
+    minimizer: [
+      new MinimizerPlugin({
+        test: /\.(js|css|html|svg)$/i,
+        generate: {
+          gzip: {
+            implementation: MinimizerPlugin.compress,
+            options: { algorithm: "gzip" },
+            type: "asset",
+            filename: "[path][base].gz",
+          },
+          brotli: {
+            implementation: MinimizerPlugin.compress,
+            options: {
+              algorithm: "brotliCompress",
+              compressionOptions: { params: {} },
+            },
+            type: "asset",
+            filename: "[path][base].br",
+          },
+        },
+      }),
+    ],
+  },
+};
+```
+
+Minifying and compressing are then one plugin over one pass of filtering and one
+cache, and the ordering they need — compress what minification produced — is
+what `stage` states rather than what applying two plugins in the right order
+happens to give. Each algorithm is run at its own maximum by default (`zlib`'s
+best level, brotli's best quality); name `compressionOptions` to say otherwise.
+
+It is an ordinary minimizer too, so [`minify`](#minify) takes it the way it
+takes `terserMinify` or `swcMinify`. There it compresses the asset **in place**
+rather than beside it — the shape for a server that says what the encoding is
+through `Content-Encoding` while the URL stays as it was:
+
+```js
+const MinimizerPlugin = require("minimizer-webpack-plugin");
+
+module.exports = {
+  optimization: {
+    minimize: true,
+    minimizer: [
+      new MinimizerPlugin({
+        test: /\.js$/i,
+        minify: MinimizerPlugin.compress,
+        minimizerOptions: { algorithm: "gzip" },
+      }),
+    ],
+  },
+};
+```
+
+An array runs its minimizers in order, each one reading what the last produced,
+so minifying and then compressing in place is one entry after another — and each
+states its own `options`. Each runs at the stage it asks for — terser before the
+hash is taken, `compress` after — so `[contenthash]` still names what
+minification produced:
+
+```js
+new MinimizerPlugin({
+  test: /\.js$/i,
+  minify: [
+    { implementation: MinimizerPlugin.terserMinify },
+    {
+      implementation: MinimizerPlugin.compress,
+      options: { algorithm: "brotliCompress" },
+    },
+  ],
+});
+```
 
 `ecma` is filled in from
 [`output.environment`](https://webpack.js.org/configuration/output/#outputenvironment)

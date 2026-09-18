@@ -1287,6 +1287,27 @@ describe("generate options", () => {
     ).toThrow(/`filter` and `deleteOriginalAssets` in `generate`'s 'webp'/);
   });
 
+  it("should reject the compression fields on an `import` generator", () => {
+    const webp = encoderNamed("WEBP");
+
+    // They describe a second file being worth writing, and an `import`
+    // generator writes none — it re-encodes the module it was asked for.
+    expect(() =>
+      construct({
+        generate: {
+          webp: {
+            implementation: webp,
+            threshold: 1024,
+            minRatio: 0.8,
+            relatedName: "gzipped",
+          },
+        },
+      }),
+    ).toThrow(
+      /`threshold` and `minRatio` and `relatedName` in `generate`'s 'webp'/,
+    );
+  });
+
   it("should reject options given in both places for one generator", () => {
     const webp = encoderNamed("WEBP");
 
@@ -1783,6 +1804,885 @@ describe("replaceExtension", () => {
     ["dir.x/readme", "png", "dir.x/readme.png"],
   ])("should rewrite %s to .%s", (name, extension, expected) => {
     expect(replaceExtension(name, extension)).toBe(expected);
+  });
+});
+
+describe("what a generated file promises about its name", () => {
+  /**
+   * @param {string} filename the generator's filename template
+   * @returns {Promise<import("webpack").AssetInfo>} what the generated file says
+   */
+  const infoFor = async (filename) => {
+    const copy = (input) => ({
+      code: Buffer.from(Object.values(input)[0]),
+    });
+
+    copy.supportsBinary = () => true;
+    copy.supportsWorker = () => false;
+
+    const compiler = getCompiler({
+      entry: path.resolve(__dirname, "./fixtures/images.js"),
+      output: {
+        path: path.resolve(__dirname, "./dist"),
+        filename: "[name].[contenthash].js",
+      },
+      module: {
+        rules: [
+          {
+            test: /\.(png|jpe?g|svg|webp)/i,
+            type: "asset/resource",
+            generator: { filename: "[name].[contenthash][ext]" },
+          },
+        ],
+      },
+    });
+
+    new MinimizerPlugin({
+      test: /\.png$/i,
+      generate: { implementation: copy, type: "asset", filename },
+    }).apply(compiler);
+
+    const stats = await compile(compiler);
+    const generated = Object.keys(stats.compilation.assets).find((name) =>
+      name.includes(".copy"),
+    );
+
+    return stats.compilation.getAsset(generated).info;
+  };
+
+  it("should stay immutable where the name still carries the original's", async () => {
+    const info = await infoFor("[path][name].copy[ext]");
+
+    expect(info.immutable).toBe(true);
+  });
+
+  it("should not claim immutable where the name does not", async () => {
+    const info = await infoFor("fixed.copy.png");
+
+    // The original's promise rested on a hash in its name; a fixed name
+    // carries none, so the file behind it can change.
+    expect(info.immutable).toBeUndefined();
+  });
+});
+
+describe("generate beside the minifier", () => {
+  /**
+   * @returns {EXPECTED_ANY} a generator that hands back what it read
+   */
+  const copier = () => {
+    /**
+     * @param {{ [file: string]: string | Buffer }} input input
+     * @returns {{ code: Buffer }} the same bytes
+     */
+    const copy = (input) => {
+      const [[name, code]] = Object.entries(input);
+
+      copy.saw.push(name);
+
+      return { code: Buffer.isBuffer(code) ? code : Buffer.from(code) };
+    };
+
+    copy.supportsBinary = () => true;
+    copy.supportsWorker = () => false;
+    copy.saw = [];
+
+    return copy;
+  };
+
+  it("should read the `.js` default where no `test` was set", async () => {
+    const copy = copier();
+    const compiler = getCompiler({
+      entry: path.resolve(__dirname, "./fixtures/images.js"),
+      module: { rules: IMAGE_RULES },
+    });
+
+    new MinimizerPlugin({
+      generate: {
+        implementation: copy,
+        type: "asset",
+        filename: "[path][name].copy[ext]",
+      },
+    }).apply(compiler);
+
+    const stats = await compile(compiler);
+
+    // The default is the plugin's, not the minifier's, so a generator written
+    // for images is given a `test` that names them.
+    expect(copy.saw).toEqual(["main.js"]);
+    expect(getErrors(stats)).toEqual([]);
+  });
+
+  it("should still honour a `test` that is set", async () => {
+    const copy = copier();
+    const compiler = getCompiler({
+      entry: path.resolve(__dirname, "./fixtures/images.js"),
+      module: { rules: IMAGE_RULES },
+    });
+
+    new MinimizerPlugin({
+      test: /\.png$/i,
+      generate: {
+        implementation: copy,
+        type: "asset",
+        filename: "[path][name].copy[ext]",
+      },
+    }).apply(compiler);
+
+    const stats = await compile(compiler);
+
+    expect(copy.saw).toEqual(["image.png"]);
+    expect(getErrors(stats)).toEqual([]);
+  });
+
+  it("should minify as well as generate, and mark what it minified", async () => {
+    const compiler = getCompiler({
+      entry: path.resolve(__dirname, "./fixtures/images.js"),
+      module: { rules: IMAGE_RULES },
+    });
+
+    new MinimizerPlugin({
+      test: /\.(png|js)$/i,
+      generate: {
+        implementation: (input) => ({
+          code: Buffer.from(Object.values(input)[0]),
+        }),
+        type: "asset",
+        filename: "[path][name].copy[ext]",
+      },
+    }).apply(compiler);
+
+    const stats = await compile(compiler);
+
+    // Both jobs run: the default minifier over the bundle, the generator over
+    // what `test` named — and `terserMinify` declines the image itself.
+    expect(readAsset("main.js", compiler, stats)).not.toContain("\n");
+    expect(
+      /** @type {import("webpack").Asset} */ (
+        stats.compilation.getAsset("main.js")
+      ).info.minimized,
+    ).toBe(true);
+    expect(
+      /** @type {import("webpack").Asset} */ (
+        stats.compilation.getAsset("image.png")
+      ).info.minimized,
+    ).toBeUndefined();
+    expect(Object.keys(stats.compilation.assets)).toContain("image.copy.png");
+    expect(getErrors(stats)).toEqual([]);
+  });
+
+  it("should not rename a bundle no minimizer of its own would touch", async () => {
+    /**
+     * @param {boolean} withPlugin whether to apply the plugin
+     * @returns {Promise<string[]>} the emitted JavaScript names
+     */
+    const namesFrom = async (withPlugin) => {
+      const compiler = getCompiler({
+        entry: path.resolve(__dirname, "./fixtures/images.js"),
+        output: {
+          path: path.resolve(__dirname, "./dist"),
+          filename: "[name].[fullhash].js",
+        },
+        module: { rules: IMAGE_RULES },
+      });
+
+      if (withPlugin) {
+        new MinimizerPlugin({
+          test: /\.png$/i,
+          generate: {
+            implementation: (input) => ({
+              code: Buffer.from(Object.values(input)[0]),
+            }),
+            type: "asset",
+            filename: "[path][name].copy[ext]",
+          },
+        }).apply(compiler);
+      }
+
+      const stats = await compile(compiler);
+
+      return Object.keys(stats.compilation.assets)
+        .filter((name) => name.endsWith(".js"))
+        .sort();
+    };
+
+    // `test` names images, so no minimizer here is ever handed the bundle:
+    // salting its hash would rename a file this instance never rewrites.
+    expect(await namesFrom(true)).toEqual(await namesFrom(false));
+  });
+
+  it("should still rename when a minimizer would be handed the bundle", async () => {
+    /**
+     * @param {EXPECTED_ANY} minimizerOptions what to run terser with
+     * @returns {Promise<string[]>} the emitted JavaScript names
+     */
+    const namesFrom = async (minimizerOptions) => {
+      const compiler = getCompiler({
+        entry: path.resolve(__dirname, "./fixtures/images.js"),
+        output: {
+          path: path.resolve(__dirname, "./dist"),
+          filename: "[name].[fullhash].js",
+        },
+        module: { rules: IMAGE_RULES },
+      });
+
+      new MinimizerPlugin({
+        minimizerOptions,
+        generate: {
+          implementation: (input) => ({
+            code: Buffer.from(Object.values(input)[0]),
+          }),
+          type: "asset",
+          filename: "[path][name].copy[ext]",
+        },
+      }).apply(compiler);
+
+      const stats = await compile(compiler);
+
+      return Object.keys(stats.compilation.assets)
+        .filter((name) => name.endsWith(".js"))
+        .sort();
+    };
+
+    // The guard above must not cost the salt its job: what terser is run with
+    // still varies the name of what it rewrote.
+    expect(await namesFrom({ mangle: true })).not.toEqual(
+      await namesFrom({ mangle: false }),
+    );
+  });
+
+  it("should salt where a function names the file, which cannot be read ahead", async () => {
+    /**
+     * @param {boolean} withPlugin whether to apply the plugin
+     * @returns {Promise<string[]>} the emitted JavaScript names
+     */
+    const namesFrom = async (withPlugin) => {
+      const compiler = getCompiler({
+        entry: path.resolve(__dirname, "./fixtures/images.js"),
+        output: {
+          path: path.resolve(__dirname, "./dist"),
+          filename: () => "[name].[fullhash].js",
+        },
+        module: { rules: IMAGE_RULES },
+      });
+
+      if (withPlugin) {
+        new MinimizerPlugin({
+          test: /\.png$/i,
+          generate: {
+            implementation: (input) => ({
+              code: Buffer.from(Object.values(input)[0]),
+            }),
+            type: "asset",
+            filename: "[path][name].copy[ext]",
+          },
+        }).apply(compiler);
+      }
+
+      const stats = await compile(compiler);
+
+      return Object.keys(stats.compilation.assets)
+        .filter((name) => name.endsWith(".js"))
+        .sort();
+    };
+
+    // Nothing can be read off a function before it is called, so the salt
+    // stands rather than being skipped on a guess.
+    expect(await namesFrom(true)).not.toEqual(await namesFrom(false));
+  });
+
+  it("should still minify when only a generator was configured", async () => {
+    const compiler = getCompiler({
+      entry: path.resolve(__dirname, "./fixtures/images.js"),
+      module: { rules: IMAGE_RULES },
+    });
+
+    new MinimizerPlugin({
+      generate: {
+        implementation: (input) => ({
+          code: Buffer.from(Object.values(input)[0]),
+        }),
+        type: "asset",
+        filename: "[path][name].copy[ext]",
+      },
+    }).apply(compiler);
+
+    const stats = await compile(compiler);
+
+    // Configuring a generator does not turn the minifier off.
+    expect(readAsset("main.js", compiler, stats)).not.toContain("\n");
+    expect(
+      /** @type {import("webpack").Asset} */ (
+        stats.compilation.getAsset("main.js")
+      ).info.minimized,
+    ).toBe(true);
+    expect(getErrors(stats)).toEqual([]);
+  });
+});
+
+describe("generate over a file that is already there", () => {
+  it("should record `related` and delete the original even when the file exists", async () => {
+    const compiler = getCompiler({
+      entry: path.resolve(__dirname, "./fixtures/images.js"),
+      module: { rules: IMAGE_RULES },
+    });
+
+    /** Writes the name the generator is about to write, before it runs. */
+    class AlreadyThere {
+      /**
+       * @param {import("webpack").Compiler} instance compiler
+       * @returns {void}
+       */
+      apply(instance) {
+        instance.hooks.compilation.tap("AlreadyThere", (compilation) => {
+          compilation.hooks.processAssets.tap(
+            {
+              name: "AlreadyThere",
+              stage:
+                compiler.webpack.Compilation.PROCESS_ASSETS_STAGE_ADDITIONAL,
+            },
+            () => {
+              compilation.emitAsset(
+                "image.copy.png",
+                new compiler.webpack.sources.RawSource(Buffer.from("stale")),
+              );
+            },
+          );
+        });
+      }
+    }
+
+    new AlreadyThere().apply(compiler);
+    new MinimizerPlugin({
+      test: /^image\.png$/i,
+      generate: {
+        implementation: (input) => ({
+          code: Buffer.from(Object.values(input)[0]),
+        }),
+        type: "asset",
+        filename: "[path][name].copy[ext]",
+        relatedName: "copied",
+        deleteOriginalAssets: true,
+      },
+    }).apply(compiler);
+
+    const stats = await compile(compiler);
+    const names = Object.keys(stats.compilation.assets);
+
+    expect(getErrors(stats)).toEqual([]);
+    // Written over rather than emitted, and the original still gone with it.
+    expect(names).toContain("image.copy.png");
+    expect(names).not.toContain("image.png");
+    expect(readAsset("image.copy.png", compiler, stats)).not.toBe("stale");
+  });
+
+  it("should not keep what the name it wrote over promised", async () => {
+    const compiler = getCompiler({
+      entry: path.resolve(__dirname, "./fixtures/images.js"),
+      module: { rules: IMAGE_RULES },
+    });
+
+    /** Writes the name the generator is about to write, and promises for it. */
+    class AlreadyThere {
+      /**
+       * @param {import("webpack").Compiler} instance compiler
+       * @returns {void}
+       */
+      apply(instance) {
+        instance.hooks.compilation.tap("AlreadyThere", (compilation) => {
+          compilation.hooks.processAssets.tap(
+            {
+              name: "AlreadyThere",
+              stage:
+                compiler.webpack.Compilation.PROCESS_ASSETS_STAGE_ADDITIONAL,
+            },
+            () => {
+              compilation.emitAsset(
+                "image.copy.png",
+                new compiler.webpack.sources.RawSource(Buffer.from("stale")),
+                { immutable: true, sourceFilename: "somewhere/else.png" },
+              );
+            },
+          );
+        });
+      }
+    }
+
+    new AlreadyThere().apply(compiler);
+    new MinimizerPlugin({
+      test: /^image\.png$/i,
+      generate: {
+        implementation: (input) => ({
+          code: Buffer.from(Object.values(input)[0]),
+        }),
+        type: "asset",
+        filename: "[path][name].copy[ext]",
+      },
+    }).apply(compiler);
+
+    const stats = await compile(compiler);
+    const { info } = /** @type {import("webpack").Asset} */ (
+      stats.compilation.getAsset("image.copy.png")
+    );
+
+    expect(getErrors(stats)).toEqual([]);
+    // What the generator says of the file it wrote, and nothing the name
+    // carried before it: webpack merges an info object into the old one.
+    expect(info.immutable).toBeUndefined();
+    expect(info.sourceFilename).toBeUndefined();
+    expect(info.generated).toBe(true);
+  });
+
+  it("should record `related` on the original where it is kept", async () => {
+    const compiler = getCompiler({
+      entry: path.resolve(__dirname, "./fixtures/images.js"),
+      module: { rules: IMAGE_RULES },
+    });
+
+    /** Writes the name the generator is about to write, before it runs. */
+    class AlreadyThere {
+      /**
+       * @param {import("webpack").Compiler} instance compiler
+       * @returns {void}
+       */
+      apply(instance) {
+        instance.hooks.compilation.tap("AlreadyThere", (compilation) => {
+          compilation.hooks.processAssets.tap(
+            {
+              name: "AlreadyThere",
+              stage:
+                compiler.webpack.Compilation.PROCESS_ASSETS_STAGE_ADDITIONAL,
+            },
+            () => {
+              compilation.emitAsset(
+                "image.copy.png",
+                new compiler.webpack.sources.RawSource(Buffer.from("stale")),
+              );
+            },
+          );
+        });
+      }
+    }
+
+    new AlreadyThere().apply(compiler);
+    new MinimizerPlugin({
+      test: /^image\.png$/i,
+      generate: {
+        implementation: (input) => ({
+          code: Buffer.from(Object.values(input)[0]),
+        }),
+        type: "asset",
+        filename: "[path][name].copy[ext]",
+        relatedName: "copied",
+      },
+    }).apply(compiler);
+
+    const stats = await compile(compiler);
+    const original = /** @type {import("webpack").Asset} */ (
+      stats.compilation.getAsset("image.png")
+    );
+
+    expect(getErrors(stats)).toEqual([]);
+    expect(
+      /** @type {{ [key: string]: string }} */ (original.info.related).copied,
+    ).toBe("image.copy.png");
+  });
+});
+
+describe("deleting the asset a file was written beside", () => {
+  it("should keep the generated file when `relatedName` is set too", async () => {
+    const compiler = getCompiler({
+      entry: path.resolve(__dirname, "./fixtures/images.js"),
+      module: { rules: IMAGE_RULES },
+    });
+
+    new MinimizerPlugin({
+      test: /^image\.png$/i,
+      generate: {
+        implementation: (input) => ({
+          code: Buffer.from(Object.values(input)[0]),
+        }),
+        type: "asset",
+        filename: "[path][name].copy[ext]",
+        relatedName: "copied",
+        deleteOriginalAssets: true,
+      },
+    }).apply(compiler);
+
+    const stats = await compile(compiler);
+    const names = Object.keys(stats.compilation.assets);
+
+    // Deleting an asset takes everything its `related` names with it, so the
+    // two together must not delete the file that was just written.
+    expect(getErrors(stats)).toEqual([]);
+    expect(names).toContain("image.copy.png");
+    expect(names).not.toContain("image.png");
+  });
+
+  it("should not mind a second generator having deleted it already", async () => {
+    const compiler = getCompiler({
+      entry: path.resolve(__dirname, "./fixtures/images.js"),
+      module: { rules: IMAGE_RULES },
+    });
+
+    /**
+     * @param {string} suffix what to name what it writes
+     * @returns {EXPECTED_ANY} one generator
+     */
+    const copyTo = (suffix) => ({
+      implementation: (input) => ({
+        code: Buffer.from(Object.values(input)[0]),
+      }),
+      type: "asset",
+      filename: `[path][name].${suffix}[ext]`,
+      deleteOriginalAssets: true,
+    });
+
+    new MinimizerPlugin({
+      test: /^image\.png$/i,
+      generate: { one: copyTo("one"), two: copyTo("two") },
+    }).apply(compiler);
+
+    const stats = await compile(compiler);
+    const names = Object.keys(stats.compilation.assets);
+
+    // Both wrote, and whichever deleted second found nothing left to delete.
+    expect(getErrors(stats)).toEqual([]);
+    expect(names).toContain("image.one.png");
+    expect(names).toContain("image.two.png");
+    expect(names).not.toContain("image.png");
+  });
+
+  it("should keep a file written under the original's own name", async () => {
+    const compiler = getCompiler({
+      entry: { one: path.resolve(__dirname, "./fixtures/entry.js") },
+    });
+
+    new MinimizerPlugin({
+      parallel: false,
+      test: /\.js$/i,
+      generate: {
+        implementation: (input) => ({
+          code: `/* generated */${Object.values(input)[0]}`,
+        }),
+        type: "asset",
+        filename: "[path][base]",
+        deleteOriginalAssets: true,
+      },
+    }).apply(compiler);
+
+    const stats = await compile(compiler);
+
+    // Re-encoding a file in place names it what it was called, so there is no
+    // original left beside it to delete — only the file just written.
+    expect(getErrors(stats)).toEqual([]);
+    expect(Object.keys(stats.compilation.assets)).toEqual(["one.js"]);
+    expect(readAsset("one.js", compiler, stats)).toMatch(
+      /^\/\* generated \*\//,
+    );
+  });
+});
+
+describe("generate from an asset emitted late", () => {
+  it("should generate from an asset added after the generators ran", async () => {
+    const seen = [];
+    /**
+     * @param {{ [file: string]: string | Buffer }} input input
+     * @returns {{ code: Buffer }} the same bytes
+     */
+    const copy = (input) => {
+      const [[name, code]] = Object.entries(input);
+
+      seen.push(name);
+
+      return { code: Buffer.isBuffer(code) ? code : Buffer.from(code) };
+    };
+
+    copy.supportsBinary = () => true;
+    copy.supportsWorker = () => false;
+
+    class EmitLate {
+      /**
+       * @param {import("webpack").Compiler} inner compiler
+       * @returns {void}
+       */
+      apply(inner) {
+        const { RawSource } = inner.webpack.sources;
+
+        inner.hooks.compilation.tap("EmitLate", (compilation) => {
+          compilation.hooks.processAssets.tap(
+            {
+              name: "EmitLate",
+              stage: compilation.constructor.PROCESS_ASSETS_STAGE_REPORT,
+            },
+            () => {
+              compilation.emitAsset("late.txt", new RawSource("late bytes"));
+            },
+          );
+        });
+      }
+    }
+
+    const compiler = getCompiler({
+      entry: path.resolve(__dirname, "./fixtures/images.js"),
+      module: { rules: IMAGE_RULES },
+    });
+
+    new EmitLate().apply(compiler);
+    new MinimizerPlugin({
+      test: /\.txt$/i,
+      generate: {
+        implementation: copy,
+        type: "asset",
+        filename: "[path][name].copy[ext]",
+      },
+    }).apply(compiler);
+
+    const stats = await compile(compiler);
+
+    // The tap is re-invoked for what arrives after it first ran, so a file
+    // another plugin adds late still gets the one that belongs beside it.
+    expect(seen).toContain("late.txt");
+    expect(Object.keys(stats.compilation.assets)).toContain("late.copy.txt");
+    expect(getErrors(stats)).toEqual([]);
+  });
+
+  it("should offer each asset once, and never a file of its own making", async () => {
+    const minified = [];
+    const generated = [];
+
+    /**
+     * @param {string[]} seen where to record what it was handed
+     * @returns {(input: { [file: string]: string | Buffer }) => { code: string | Buffer }} the function
+     */
+    const recording = (seen) => (input) => {
+      const [[name, code]] = Object.entries(input);
+
+      seen.push(name);
+
+      return { code };
+    };
+
+    class EmitLate {
+      /**
+       * @param {import("webpack").Compiler} inner compiler
+       * @returns {void}
+       */
+      apply(inner) {
+        const { RawSource } = inner.webpack.sources;
+
+        inner.hooks.compilation.tap("EmitLate", (compilation) => {
+          compilation.hooks.processAssets.tap(
+            {
+              name: "EmitLate",
+              stage: compilation.constructor.PROCESS_ASSETS_STAGE_REPORT,
+            },
+            () => {
+              if (!compilation.getAsset("late.js")) {
+                compilation.emitAsset(
+                  "late.js",
+                  new RawSource("var late = 1;"),
+                );
+              }
+            },
+          );
+        });
+      }
+    }
+
+    const generate = recording(generated);
+
+    generate.getStage = (
+      /** @type {typeof import("webpack").Compilation} */ compilation,
+    ) => compilation.PROCESS_ASSETS_STAGE_OPTIMIZE_TRANSFER;
+
+    const compiler = getCompiler({
+      entry: { one: path.resolve(__dirname, "./fixtures/entry.js") },
+    });
+
+    new EmitLate().apply(compiler);
+    new MinimizerPlugin({
+      parallel: false,
+      test: /.*/,
+      minify: recording(minified),
+      generate: {
+        implementation: generate,
+        type: "asset",
+        filename: "[path][base].gz",
+      },
+    }).apply(compiler);
+
+    const stats = await compile(compiler);
+
+    // Each asset once to each pass, `late.js` included — and `one.js.gz`, which
+    // the generator wrote, to neither: minifying it is what it is not.
+    expect(minified).toEqual(["one.js", "late.js"]);
+    expect(generated).toEqual(["one.js", "late.js"]);
+    expect(Object.keys(stats.compilation.assets).sort()).toEqual([
+      "late.js",
+      "late.js.gz",
+      "one.js",
+      "one.js.gz",
+    ]);
+    expect(getErrors(stats)).toEqual([]);
+  });
+});
+
+describe("generate assets, what is worth writing", () => {
+  /**
+   * A generator that pads or shrinks what it read, so `threshold` and
+   * `minRatio` can be driven from a known size.
+   * @param {number} factor how much of the input to hand back
+   * @returns {EXPECTED_ANY} the generator
+   */
+  const scaleBy = (factor) => {
+    /**
+     * @param {{ [file: string]: string | Buffer }} input input
+     * @returns {{ code: Buffer }} the scaled result
+     */
+    const scale = (input) => {
+      const [[, code]] = Object.entries(input);
+      const bytes = Buffer.isBuffer(code) ? code : Buffer.from(code);
+
+      scale.calls += 1;
+
+      return {
+        code:
+          factor <= 1
+            ? bytes.subarray(0, Math.ceil(bytes.length * factor))
+            : Buffer.concat([bytes, Buffer.alloc(bytes.length * (factor - 1))]),
+      };
+    };
+
+    scale.supportsBinary = () => true;
+    scale.supportsWorker = () => false;
+    scale.calls = 0;
+
+    return scale;
+  };
+
+  /**
+   * @param {object} descriptor extra generator descriptor keys
+   * @param {EXPECTED_ANY} implementation the generator
+   * @returns {Promise<EXPECTED_ANY>} what the build produced
+   */
+  const build = async (descriptor, implementation) => {
+    const compiler = getCompiler({
+      entry: path.resolve(__dirname, "./fixtures/images.js"),
+      module: { rules: IMAGE_RULES },
+    });
+
+    new MinimizerPlugin({
+      test: /\.png$/i,
+      generate: {
+        implementation,
+        type: "asset",
+        filename: "[path][name].copy[ext]",
+        ...descriptor,
+      },
+    }).apply(compiler);
+
+    const stats = await compile(compiler);
+
+    return { compiler, stats, assets: Object.keys(stats.compilation.assets) };
+  };
+
+  it("should skip an asset smaller than `threshold`", async () => {
+    const scale = scaleBy(1);
+    const { stats, assets } = await build({ threshold: 1024 * 1024 }, scale);
+
+    // Nothing is even read: the size is known before the generator runs.
+    expect(scale.calls).toBe(0);
+    expect(assets).not.toContain("image.copy.png");
+    expect(getErrors(stats)).toEqual([]);
+  });
+
+  it("should generate from an asset larger than `threshold`", async () => {
+    const scale = scaleBy(1);
+    const { stats, assets } = await build({ threshold: 1024 }, scale);
+
+    expect(scale.calls).toBe(1);
+    expect(assets).toContain("image.copy.png");
+    expect(getErrors(stats)).toEqual([]);
+  });
+
+  it("should drop a result that is not `minRatio` smaller", async () => {
+    const scale = scaleBy(2);
+    const { stats, assets } = await build({ minRatio: 0.8 }, scale);
+
+    // It ran and its answer was twice the size, so keeping it would cost a
+    // request to serve more bytes than the file it came from.
+    expect(scale.calls).toBe(1);
+    expect(assets).not.toContain("image.copy.png");
+    expect(getErrors(stats)).toEqual([]);
+  });
+
+  it("should keep a result that is `minRatio` smaller", async () => {
+    const scale = scaleBy(0.5);
+    const { stats, assets } = await build({ minRatio: 0.8 }, scale);
+
+    expect(assets).toContain("image.copy.png");
+    expect(getErrors(stats)).toEqual([]);
+  });
+
+  it("should record the generated asset under `relatedName`", async () => {
+    const { stats } = await build({ relatedName: "copied" }, scaleBy(1));
+
+    // The original points at it, which is how a server asked for the original
+    // finds the file beside it.
+    expect(stats.compilation.getAsset("image.png").info.related.copied).toBe(
+      "image.copy.png",
+    );
+    expect(getErrors(stats)).toEqual([]);
+  });
+
+  it("should leave an asset already carrying that key alone", async () => {
+    const scale = scaleBy(1);
+    const compiler = getCompiler({
+      entry: path.resolve(__dirname, "./fixtures/images.js"),
+      module: { rules: IMAGE_RULES },
+    });
+
+    class AlreadyCopied {
+      /**
+       * @param {import("webpack").Compiler} inner compiler
+       * @returns {void}
+       */
+      apply(inner) {
+        inner.hooks.compilation.tap("AlreadyCopied", (compilation) => {
+          compilation.hooks.processAssets.tap(
+            {
+              name: "AlreadyCopied",
+              stage: compilation.constructor.PROCESS_ASSETS_STAGE_ADDITIONS,
+            },
+            (assets) => {
+              for (const name of Object.keys(assets)) {
+                if (/\.png$/i.test(name)) {
+                  compilation.updateAsset(name, (one) => one, {
+                    related: { copied: "elsewhere.png" },
+                  });
+                }
+              }
+            },
+          );
+        });
+      }
+    }
+
+    new AlreadyCopied().apply(compiler);
+    new MinimizerPlugin({
+      test: /\.png$/i,
+      generate: {
+        implementation: scale,
+        type: "asset",
+        filename: "[path][name].copy[ext]",
+        relatedName: "copied",
+      },
+    }).apply(compiler);
+
+    const stats = await compile(compiler);
+
+    expect(scale.calls).toBe(0);
+    expect(getErrors(stats)).toEqual([]);
   });
 });
 

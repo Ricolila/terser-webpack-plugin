@@ -206,13 +206,33 @@ const {
  */
 
 /**
+ * One generator, written as an object stating how to run it.
+ * @typedef {object} GeneratorDescriptor
+ * @property {MinimizerImplementation<EXPECTED_ANY>} implementation the generator itself
+ * @property {MinimizerOptions<EXPECTED_ANY>=} options options for this generator, preferred over the deprecated `generatorOptions`
+ * @property {("import" | "asset")=} type `import` re-encodes a module as it is built, so the import that asked for it is renamed with it; `asset` writes a new file beside one already emitted
+ * @property {string=} filename name for the generated asset, as a webpack filename template. `asset` generators only
+ * @property {((name: string) => boolean)=} filter decides per asset whether to generate from it, on top of `test`/`include`/`exclude`
+ * @property {boolean=} deleteOriginalAssets removes the asset generated from. `asset` generators only
+ * @property {number=} threshold generate only from assets larger than this, in bytes. `asset` generators only
+ * @property {number=} minRatio keep the generated asset only when it is this much smaller than the one it was read from. `asset` generators only
+ * @property {(string | false)=} relatedName the key the generated asset is recorded under in the original's `related` info. `asset` generators only
+ */
+
+/**
+ * What `generate` may be written as: one generator, a list of them, a
+ * descriptor, or an object naming descriptors an asset asks for with `?as=`.
+ * @typedef {MinimizerImplementation<EXPECTED_ANY> | MinimizerImplementation<EXPECTED_ANY>[] | GeneratorDescriptor | { [preset: string]: MinimizerImplementation<EXPECTED_ANY> | MinimizerImplementation<EXPECTED_ANY>[] | GeneratorDescriptor }} Generate
+ */
+
+/**
  * @typedef {object} BasePluginOptions
  * @property {Rules=} test test rule
  * @property {Rules=} include include rile
  * @property {Rules=} exclude exclude rule
  * @property {ExtractCommentsOptions=} extractComments extract comments options
  * @property {Parallel=} parallel parallel option
- * @property {MinimizerImplementation<EXPECTED_ANY>=} generate rewrites a module's own bytes as it is built, so a re-encoding can rename the asset
+ * @property {Generate=} generate rewrites a module's own bytes as it is built, so a re-encoding can rename the asset, or writes a new file beside one already emitted
  * @property {MinimizerOptions<EXPECTED_ANY>=} generatorOptions options for `generate`
  */
 
@@ -254,6 +274,34 @@ const declaredStage = (compiler, implementation) => {
   }
 
   return latest;
+};
+
+/**
+ * The name a chunk's JavaScript asset will take, as far as it is knowable
+ * while the hash that name contains is still being computed.
+ * @param {Compilation} compilation compilation
+ * @param {import("webpack").Chunk} chunk chunk
+ * @returns {string | undefined} the name, or undefined where a function names it
+ */
+const chunkAssetName = (compilation, chunk) => {
+  const { outputOptions } = compilation;
+  const template =
+    chunk.filenameTemplate ||
+    (chunk.canBeInitial()
+      ? outputOptions.filename
+      : outputOptions.chunkFilename);
+
+  if (typeof template !== "string") {
+    return undefined;
+  }
+
+  // Every placeholder stands for text it has not got yet: what is being asked
+  // of the name is its path and extension, which none of them carries.
+  return template
+    .replace(/\[(?:full|chunk|content)hash(?::\d+)?]/gi, "0")
+    .replace(/\[name]/gi, String(chunk.name || chunk.id))
+    .replace(/\[id]/gi, String(chunk.id))
+    .replace(/\[runtime]/gi, String(chunk.runtime));
 };
 
 /**
@@ -331,12 +379,10 @@ class MinimizerPlugin {
     // TODO handle json and etc in the next major release
     // TODO make `minimizer` option instead `minify` and `terserOptions` in the next major release, also rename `terserMinify` to `terserMinimize`
     const {
-      minify = /** @type {MinimizerImplementation<T>} */ (
-        /** @type {unknown} */ (terserMinify)
-      ),
+      minify: declaredMinify,
       minimizerOptions,
       terserOptions,
-      test = /\.[cm]?js(\?.*)?$/i,
+      test: declaredTest,
       extractComments = true,
       parallel = true,
       include,
@@ -344,6 +390,17 @@ class MinimizerPlugin {
       generate,
       generatorOptions,
     } = this.rawOptions;
+
+    // The JavaScript minifier and the names it reads are what this plugin is,
+    // so both stand whether or not a generator was configured too.
+    const minimizers =
+      typeof declaredMinify !== "undefined"
+        ? declaredMinify
+        : /** @type {MinimizerImplementation<T>} */ (
+            /** @type {unknown} */ (terserMinify)
+          );
+    const test =
+      typeof declaredTest !== "undefined" ? declaredTest : /\.[cm]?js(\?.*)?$/i;
 
     // `terserOptions` is a deprecated alias of `minimizerOptions`; prefer the
     // new name when both are provided.
@@ -367,7 +424,7 @@ class MinimizerPlugin {
       exclude,
       minimizer:
         /** @type {{ implementation: MinimizerImplementation<T>, options: MinimizerOptions<T>, filters?: (((name: string, info: AssetInfo) => boolean | undefined) | undefined)[] }} */
-        (normalizeMinimizers(minify, resolvedMinimizerOptions)),
+        (normalizeMinimizers(minimizers, resolvedMinimizerOptions)),
       // Absent unless asked for: it runs while modules build, where the plugin
       // otherwise does nothing.
       generator: generate
@@ -587,6 +644,10 @@ class MinimizerPlugin {
       declaredFlags(one, "minimized"),
     );
 
+    // `additionalAssets` hands this pass whatever was emitted after it ran,
+    // this plugin's own generated files included, and those are not to minify.
+    const generated = this.generatedFlags();
+
     /**
      * Remember what this plugin marked an asset with, which is what a later
      * pass of it reads back rather than declining.
@@ -662,6 +723,12 @@ class MinimizerPlugin {
 
           // Skip minimizing for extracted comments assets
           if (info.extractedComments) {
+            return false;
+          }
+
+          const says = /** @type {Record<string, EXPECTED_ANY>} */ (info);
+
+          if (generated.some((flag) => says[flag])) {
             return false;
           }
 
@@ -1288,7 +1355,7 @@ class MinimizerPlugin {
    * @param {string | undefined} name the preset it is written under, where it has one
    * @param {EXPECTED_ANY} entry what was written there
    * @param {EXPECTED_ANY} declared what `generatorOptions` says for it
-   * @returns {{ name: string | undefined, implementation: EXPECTED_ANY, options: EXPECTED_ANY, type: string | undefined, filename: string | undefined, filter: ((name: string) => boolean) | undefined, deleteOriginalAssets: boolean | undefined }} the generator
+   * @returns {{ name: string | undefined, implementation: EXPECTED_ANY, options: EXPECTED_ANY, type: string | undefined, filename: string | undefined, filter: ((name: string) => boolean) | undefined, deleteOriginalAssets: boolean | undefined, threshold: number | undefined, minRatio: number | undefined, relatedName: string | false | undefined }} the generator
    */
   describeGenerator(name, entry, declared) {
     const descriptor = isDescriptor(entry) ? entry : undefined;
@@ -1306,6 +1373,9 @@ class MinimizerPlugin {
       deleteOriginalAssets: descriptor
         ? descriptor.deleteOriginalAssets
         : undefined,
+      threshold: descriptor ? descriptor.threshold : undefined,
+      minRatio: descriptor ? descriptor.minRatio : undefined,
+      relatedName: descriptor ? descriptor.relatedName : undefined,
     };
   }
 
@@ -1431,6 +1501,27 @@ class MinimizerPlugin {
   }
 
   /**
+   * Every name this plugin's `asset` generators mark what they wrote with,
+   * which is how both passes tell a generated file from one to work on.
+   * @private
+   * @returns {string[]} the names
+   */
+  generatedFlags() {
+    /** @type {string[]} */
+    const flags = [];
+
+    for (const one of this.assetGenerators()) {
+      for (const flag of declaredFlags(one.implementation, "generated")) {
+        if (!flags.includes(flag)) {
+          flags.push(flag);
+        }
+      }
+    }
+
+    return flags;
+  }
+
+  /**
    * The generators that run over emitted assets rather than over a module as
    * it builds.
    * @private
@@ -1501,6 +1592,19 @@ class MinimizerPlugin {
     // `buffer()` rather than `source()`, which answers a source holding text
     // and bytes at once with a string: every byte over 0x7f is lost in that.
     const input = source.buffer();
+    const says = /** @type {Record<string, EXPECTED_ANY>} */ (info);
+
+    // Too small to be worth a second file, and one already recorded under this
+    // generator's key has been through it.
+    if (
+      input.length < (generator.threshold || 0) ||
+      (generator.relatedName &&
+        says.related &&
+        says.related[generator.relatedName])
+    ) {
+      return;
+    }
+
     // The generator is in the item's name rather than its etag: two presets
     // reading the same asset must not answer for one another.
     const cacheItem = cache.getItemCache(
@@ -1610,9 +1714,21 @@ class MinimizerPlugin {
       return;
     }
     const generatedSource = output.source;
-    // The derived name carries the original's hash, so what the original
-    // promised about its own name still holds; its sourcemap does not follow.
-    const generatedInfo = { ...info };
+
+    // Not enough smaller to be worth serving: a second file that saves nothing
+    // still costs a request and a place in the cache.
+    if (
+      typeof generator.minRatio === "number" &&
+      generatedSource.size() / input.length > generator.minRatio
+    ) {
+      return;
+    }
+
+    // A new file rather than a rewritten one, so it inherits nothing: what the
+    // original's info says of its hashes, its module and where its source came
+    // from is true of that file and not of this one.
+    /** @type {AssetInfo} */
+    const generatedInfo = {};
 
     // The name this generator works under, which is `generated` where it says
     // nothing and `compressed` for `compress`.
@@ -1620,18 +1736,46 @@ class MinimizerPlugin {
       /** @type {Record<string, EXPECTED_ANY>} */ (generatedInfo)[flag] = true;
     }
 
-    delete generatedInfo.related;
+    // The exception, and only where the name it was given still derives from
+    // the original's: that is what carried the hash the promise rests on.
+    if (
+      info.immutable &&
+      typeof generator.filename === "string" &&
+      /(\[name]|\[base]|\[file])/.test(generator.filename)
+    ) {
+      generatedInfo.immutable = true;
+    }
 
+    // Handed over as a function, which replaces: an object is merged into what
+    // the name carried before, and this file inherits nothing.
     if (compilation.getAsset(generatedName)) {
-      compilation.updateAsset(generatedName, generatedSource, generatedInfo);
+      compilation.updateAsset(
+        generatedName,
+        generatedSource,
+        () => generatedInfo,
+      );
+    } else {
+      compilation.emitAsset(generatedName, generatedSource, generatedInfo);
+    }
+
+    if (generator.deleteOriginalAssets) {
+      // Deleting an asset takes everything its `related` names with it, so
+      // recording this file there first would delete the file just written.
+      // A generator writing under the original's own name leaves nothing to
+      // delete either: that file is now the generated one.
+      if (generatedName !== name && compilation.getAsset(name)) {
+        compilation.deleteAsset(name);
+      }
 
       return;
     }
 
-    compilation.emitAsset(generatedName, generatedSource, generatedInfo);
-
-    if (generator.deleteOriginalAssets && compilation.getAsset(name)) {
-      compilation.deleteAsset(name);
+    // Recorded on the asset it was read from, which is how a server asked for
+    // that one finds this one.
+    if (generator.relatedName) {
+      compilation.updateAsset(name, source, {
+        related: { [generator.relatedName]: generatedName },
+      });
     }
   }
 
@@ -1643,25 +1787,17 @@ class MinimizerPlugin {
    * @param {Compiler} compiler compiler
    * @param {Compilation} compilation compilation
    * @param {ReturnType<MinimizerPlugin["assetGenerators"]>} generators the generators running at this stage
+   * @param {Record<string, import("webpack").sources.Source>} assets the assets this pass was handed
    * @returns {Promise<void>}
    */
-  async generateAssets(compiler, compilation, generators) {
+  async generateAssets(compiler, compilation, generators, assets) {
     const cache = compilation.getCache("TerserWebpackPlugin|generateAssets");
     const scheduled = [];
-    // Every name this plugin's generators work under, so none of them reads a
-    // file another one wrote — whichever name that one marked it with.
-    /** @type {string[]} */
-    const produced = [];
+    // So no generator reads a file another one wrote, whichever name that one
+    // marked it with.
+    const produced = this.generatedFlags();
 
-    for (const one of this.assetGenerators()) {
-      for (const flag of declaredFlags(one.implementation, "generated")) {
-        if (!produced.includes(flag)) {
-          produced.push(flag);
-        }
-      }
-    }
-
-    for (const name of Object.keys(compilation.assets)) {
+    for (const name of Object.keys(assets)) {
       const asset = compilation.getAsset(name);
 
       if (!asset || !this.matchesName(compiler, name)) {
@@ -2092,6 +2228,16 @@ class MinimizerPlugin {
         if (typeof one.deleteOriginalAssets !== "undefined") {
           misplaced.push("deleteOriginalAssets");
         }
+
+        for (const field of ["threshold", "minRatio", "relatedName"]) {
+          if (
+            typeof (
+              /** @type {Record<string, EXPECTED_ANY>} */ (one)[field]
+            ) !== "undefined"
+          ) {
+            misplaced.push(field);
+          }
+        }
       }
 
       if (misplaced.length > 0) {
@@ -2208,9 +2354,19 @@ class MinimizerPlugin {
         options: this.options.minimizer.options,
       });
 
-      // The salt is the name this plugin shipped under, and every `[contenthash]`
-      // is taken over it: renaming it would rename every file a user serves.
       hooks.chunkHash.tap(pluginName, (chunk, hash) => {
+        const willBe = chunkAssetName(compilation, chunk);
+
+        // A chunk this instance was never pointed at cannot vary with its
+        // minimizers, so salting it would rename a file it never rewrites. A
+        // `filter` is not asked: it reads an asset's info, which no asset has
+        // yet, and guessing one could skip the salt for an asset it then takes.
+        if (typeof willBe === "string" && !this.matchesName(compiler, willBe)) {
+          return;
+        }
+
+        // The salt is the name this plugin shipped under, and every
+        // `[fullhash]` is taken over it: renaming it would rename every file.
         hash.update("TerserPlugin");
         hash.update(data);
       });
@@ -2333,8 +2489,9 @@ class MinimizerPlugin {
 
       for (const [at, generators] of generatorsByStage) {
         compilation.hooks.processAssets.tapPromise(
-          { name: pluginName, stage: at },
-          () => this.generateAssets(compiler, compilation, generators),
+          { name: pluginName, stage: at, additionalAssets: true },
+          (assets) =>
+            this.generateAssets(compiler, compilation, generators, assets),
         );
       }
 

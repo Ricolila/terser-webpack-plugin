@@ -96,7 +96,7 @@ declare class MinimizerPlugin<T = import("terser").MinifyOptions> {
    * @param {string | undefined} name the preset it is written under, where it has one
    * @param {EXPECTED_ANY} entry what was written there
    * @param {EXPECTED_ANY} declared what `generatorOptions` says for it
-   * @returns {{ name: string | undefined, implementation: EXPECTED_ANY, options: EXPECTED_ANY, type: string | undefined, filename: string | undefined, filter: ((name: string) => boolean) | undefined, deleteOriginalAssets: boolean | undefined }} the generator
+   * @returns {{ name: string | undefined, implementation: EXPECTED_ANY, options: EXPECTED_ANY, type: string | undefined, filename: string | undefined, filter: ((name: string) => boolean) | undefined, deleteOriginalAssets: boolean | undefined, threshold: number | undefined, minRatio: number | undefined, relatedName: string | false | undefined }} the generator
    */
   private describeGenerator;
   /**
@@ -131,6 +131,13 @@ declare class MinimizerPlugin<T = import("terser").MinifyOptions> {
    * @returns {Set<string>} the names
    */
   private assetFlags;
+  /**
+   * Every name this plugin's `asset` generators mark what they wrote with,
+   * which is how both passes tell a generated file from one to work on.
+   * @private
+   * @returns {string[]} the names
+   */
+  private generatedFlags;
   /**
    * The generators that run over emitted assets rather than over a module as
    * it builds.
@@ -167,6 +174,7 @@ declare class MinimizerPlugin<T = import("terser").MinifyOptions> {
    * @param {Compiler} compiler compiler
    * @param {Compilation} compilation compilation
    * @param {ReturnType<MinimizerPlugin["assetGenerators"]>} generators the generators running at this stage
+   * @param {Record<string, import("webpack").sources.Source>} assets the assets this pass was handed
    * @returns {Promise<void>}
    */
   private generateAssets;
@@ -304,6 +312,8 @@ declare namespace MinimizerPlugin {
     InternalOptions,
     MinimizerWorker,
     Parallel,
+    GeneratorDescriptor,
+    Generate,
     BasePluginOptions,
     DefinedDefaultMinimizerAndOptions,
     InternalPluginOptions,
@@ -629,6 +639,61 @@ type MinimizerWorker<T> = JestWorker & {
   minify: (options: InternalOptions<T>) => Promise<MinimizedResult>;
 };
 type Parallel = undefined | boolean | number;
+/**
+ * One generator, written as an object stating how to run it.
+ */
+type GeneratorDescriptor = {
+  /**
+   * the generator itself
+   */
+  implementation: MinimizerImplementation<EXPECTED_ANY>;
+  /**
+   * options for this generator, preferred over the deprecated `generatorOptions`
+   */
+  options?: MinimizerOptions<EXPECTED_ANY> | undefined;
+  /**
+   * `import` re-encodes a module as it is built, so the import that asked for it is renamed with it; `asset` writes a new file beside one already emitted
+   */
+  type?: ("import" | "asset") | undefined;
+  /**
+   * name for the generated asset, as a webpack filename template. `asset` generators only
+   */
+  filename?: string | undefined;
+  /**
+   * decides per asset whether to generate from it, on top of `test`/`include`/`exclude`
+   */
+  filter?: ((name: string) => boolean) | undefined;
+  /**
+   * removes the asset generated from. `asset` generators only
+   */
+  deleteOriginalAssets?: boolean | undefined;
+  /**
+   * generate only from assets larger than this, in bytes. `asset` generators only
+   */
+  threshold?: number | undefined;
+  /**
+   * keep the generated asset only when it is this much smaller than the one it was read from. `asset` generators only
+   */
+  minRatio?: number | undefined;
+  /**
+   * the key the generated asset is recorded under in the original's `related` info. `asset` generators only
+   */
+  relatedName?: (string | false) | undefined;
+};
+/**
+ * What `generate` may be written as: one generator, a list of them, a
+ * descriptor, or an object naming descriptors an asset asks for with `?as=`.
+ */
+type Generate =
+  | MinimizerImplementation<EXPECTED_ANY>
+  | MinimizerImplementation<EXPECTED_ANY>[]
+  | GeneratorDescriptor
+  | {
+      [preset: string]:
+        | MinimizerImplementation<EXPECTED_ANY>
+        | MinimizerImplementation<EXPECTED_ANY>[]
+        | GeneratorDescriptor;
+    };
 type BasePluginOptions = {
   /**
    * test rule
@@ -651,9 +716,9 @@ type BasePluginOptions = {
    */
   parallel?: Parallel | undefined;
   /**
-   * rewrites a module's own bytes as it is built, so a re-encoding can rename the asset
+   * rewrites a module's own bytes as it is built, so a re-encoding can rename the asset, or writes a new file beside one already emitted
    */
-  generate?: MinimizerImplementation<EXPECTED_ANY> | undefined;
+  generate?: Generate | undefined;
   /**
    * options for `generate`
    */

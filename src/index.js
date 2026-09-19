@@ -211,9 +211,9 @@ const {
  * @property {MinimizerImplementation<EXPECTED_ANY>} implementation the generator itself
  * @property {MinimizerOptions<EXPECTED_ANY>=} options options for this generator, preferred over the deprecated `generatorOptions`
  * @property {("import" | "asset")=} type `import` re-encodes a module as it is built, so the import that asked for it is renamed with it; `asset` writes a new file beside one already emitted
- * @property {string=} filename name for the generated asset, as a webpack filename template. `asset` generators only
+ * @property {(string | ((pathData: EXPECTED_ANY) => string))=} filename name for the generated asset, as a webpack filename template or a function answering with one. `asset` generators only
  * @property {((name: string) => boolean)=} filter decides per asset whether to generate from it, on top of `test`/`include`/`exclude`
- * @property {boolean=} deleteOriginalAssets removes the asset generated from. `asset` generators only
+ * @property {(boolean | ((name: string) => boolean))=} deleteOriginalAssets removes the asset generated from, its own file alone — whatever its `related` names stays. Written as a function it is asked per asset. `asset` generators only
  * @property {number=} threshold generate only from assets larger than this, in bytes. `asset` generators only
  * @property {number=} minRatio keep the generated asset only when it is this much smaller than the one it was read from. `asset` generators only
  * @property {(string | false)=} relatedName the key the generated asset is recorded under in the original's `related` info. `asset` generators only
@@ -237,8 +237,24 @@ const {
  */
 
 /**
+ * One minimizer, written as an object stating how to run it.
  * @template T
- * @typedef {T extends import("terser").MinifyOptions ? { minify?: MinimizerImplementation<T> | undefined, minimizerOptions?: MinimizerOptions<T> | undefined, terserOptions?: MinimizerOptions<T> | undefined } : { minify: MinimizerImplementation<T>, minimizerOptions?: MinimizerOptions<T> | undefined, terserOptions?: MinimizerOptions<T> | undefined }} DefinedDefaultMinimizerAndOptions
+ * @typedef {object} MinimizerDescriptor
+ * @property {MinimizerImplementation<T>} implementation the minimizer itself
+ * @property {MinimizerOptions<T>=} options options for this minimizer, preferred over the deprecated `minimizerOptions`
+ * @property {((name: string, info: AssetInfo) => boolean | undefined)=} filter which assets this minimizer is offered, overriding a `filter` on the function itself
+ */
+
+/**
+ * What `minify` may be written as: one minimizer, a list of them — empty for
+ * nothing to minify — or a descriptor.
+ * @template T
+ * @typedef {MinimizerImplementation<T> | (MinimizerImplementation<T> | MinimizerDescriptor<T>)[] | MinimizerDescriptor<T>} Minify
+ */
+
+/**
+ * @template T
+ * @typedef {T extends import("terser").MinifyOptions ? { minify?: Minify<T> | undefined, minimizerOptions?: MinimizerOptions<T> | undefined, terserOptions?: MinimizerOptions<T> | undefined } : { minify: Minify<T>, minimizerOptions?: MinimizerOptions<T> | undefined, terserOptions?: MinimizerOptions<T> | undefined }} DefinedDefaultMinimizerAndOptions
  */
 
 /**
@@ -1355,7 +1371,7 @@ class MinimizerPlugin {
    * @param {string | undefined} name the preset it is written under, where it has one
    * @param {EXPECTED_ANY} entry what was written there
    * @param {EXPECTED_ANY} declared what `generatorOptions` says for it
-   * @returns {{ name: string | undefined, implementation: EXPECTED_ANY, options: EXPECTED_ANY, type: string | undefined, filename: string | undefined, filter: ((name: string) => boolean) | undefined, deleteOriginalAssets: boolean | undefined, threshold: number | undefined, minRatio: number | undefined, relatedName: string | false | undefined }} the generator
+   * @returns {{ name: string | undefined, implementation: EXPECTED_ANY, options: EXPECTED_ANY, type: string | undefined, filename: string | ((pathData: EXPECTED_ANY) => string) | undefined, filter: ((name: string) => boolean) | undefined, deleteOriginalAssets: boolean | ((name: string) => boolean) | undefined, threshold: number | undefined, minRatio: number | undefined, relatedName: string | false | undefined }} the generator
    */
   describeGenerator(name, entry, declared) {
     const descriptor = isDescriptor(entry) ? entry : undefined;
@@ -1758,12 +1774,26 @@ class MinimizerPlugin {
       compilation.emitAsset(generatedName, generatedSource, generatedInfo);
     }
 
-    if (generator.deleteOriginalAssets) {
-      // Deleting an asset takes everything its `related` names with it, so
-      // recording this file there first would delete the file just written.
+    const deletes =
+      typeof generator.deleteOriginalAssets === "function"
+        ? generator.deleteOriginalAssets(name)
+        : generator.deleteOriginalAssets;
+
+    if (deletes) {
+      const still = compilation.getAsset(name);
+
       // A generator writing under the original's own name leaves nothing to
-      // delete either: that file is now the generated one.
-      if (generatedName !== name && compilation.getAsset(name)) {
+      // delete: that file is now the generated one. Another generator of this
+      // pass may have written over it too, which is the same thing — what the
+      // name holds is no longer what this one read.
+      if (generatedName !== name && still && still.source === source) {
+        // Deleting an asset takes everything its `related` names with it — a
+        // source map, another generator's file — so it goes alone.
+        compilation.updateAsset(name, source, (was) => {
+          const { related, ...rest } = was || {};
+
+          return rest;
+        });
         compilation.deleteAsset(name);
       }
 
@@ -1771,8 +1801,10 @@ class MinimizerPlugin {
     }
 
     // Recorded on the asset it was read from, which is how a server asked for
-    // that one finds this one.
-    if (generator.relatedName) {
+    // that one finds this one. A file written under that same name has replaced
+    // it, so there is nothing left to point anywhere, and writing the source
+    // back would undo what was just generated.
+    if (generator.relatedName && generatedName !== name) {
       compilation.updateAsset(name, source, {
         related: { [generator.relatedName]: generatedName },
       });
@@ -2156,7 +2188,9 @@ class MinimizerPlugin {
     const written = Array.isArray(minify) ? minify : [minify];
 
     for (const [index, one] of written.entries()) {
-      const own = isDescriptor(one) ? one.options : undefined;
+      const own = isDescriptor(one)
+        ? /** @type {MinimizerDescriptor<EXPECTED_ANY>} */ (one).options
+        : undefined;
       const twice = Array.isArray(minify)
         ? getMinimizerOptionsAt(declared, index)
         : declared;
@@ -2355,6 +2389,12 @@ class MinimizerPlugin {
       });
 
       hooks.chunkHash.tap(pluginName, (chunk, hash) => {
+        // Nothing minifying rewrites nothing, so no name owes it a hash of its
+        // own.
+        if (this.minimizers().length === 0) {
+          return;
+        }
+
         const willBe = chunkAssetName(compilation, chunk);
 
         // A chunk this instance was never pointed at cannot vary with its
@@ -2377,7 +2417,10 @@ class MinimizerPlugin {
         /** @type {EmbeddedSourceHooks} */
         (/** @type {unknown} */ (compilation.hooks));
 
+      // Nothing minifying rewrites no embedded source either, and salting the
+      // module hash would rename a file this instance never touches.
       if (
+        this.minimizers().length > 0 &&
         embeddedHooks.renderEmbeddedSource &&
         embeddedHooks.embeddedSourceHash
       ) {

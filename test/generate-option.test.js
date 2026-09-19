@@ -1970,6 +1970,79 @@ describe("generate beside the minifier", () => {
     expect(getErrors(stats)).toEqual([]);
   });
 
+  it("should not rename a bundle where `minify` is an empty list", async () => {
+    /**
+     * @param {boolean} withPlugin whether to apply the plugin
+     * @returns {Promise<string[]>} the emitted JavaScript names
+     */
+    const namesFrom = async (withPlugin) => {
+      const compiler = getCompiler({
+        entry: path.resolve(__dirname, "./fixtures/images.js"),
+        output: {
+          path: path.resolve(__dirname, "./dist"),
+          filename: "[name].[fullhash].js",
+        },
+        module: { rules: IMAGE_RULES },
+      });
+
+      if (withPlugin) {
+        new MinimizerPlugin({
+          test: /.*/,
+          minify: [],
+          generate: {
+            implementation: (input) => ({
+              code: Buffer.from(Object.values(input)[0]),
+            }),
+            type: "asset",
+            filename: "[path][name].copy[ext]",
+          },
+        }).apply(compiler);
+      }
+
+      const stats = await compile(compiler);
+
+      return Object.keys(stats.compilation.assets)
+        .filter((name) => name.endsWith(".js") && !name.includes(".copy."))
+        .sort();
+    };
+
+    // Nothing minifies, so nothing rewrites the bundle, so its name is the one
+    // it would have carried without this plugin — `test` matching it or not.
+    expect(await namesFrom(true)).toEqual(await namesFrom(false));
+  });
+
+  it("should minify nothing where `minify` is an empty list", async () => {
+    const compiler = getCompiler({
+      entry: path.resolve(__dirname, "./fixtures/images.js"),
+      module: { rules: IMAGE_RULES },
+    });
+
+    new MinimizerPlugin({
+      test: /.*/,
+      minify: [],
+      generate: {
+        implementation: (input) => ({
+          code: Buffer.from(Object.values(input)[0]),
+        }),
+        type: "asset",
+        filename: "[path][name].copy[ext]",
+      },
+    }).apply(compiler);
+
+    const stats = await compile(compiler);
+    const bundle = /** @type {import("webpack").Asset} */ (
+      stats.compilation.getAsset("main.js")
+    );
+
+    // No minimizers is a list with none in it rather than a missing one, so
+    // the passes over them simply do nothing and the generators still run.
+    expect(readAsset("main.js", compiler, stats)).toContain("\n");
+    expect(bundle.info.minimized).toBeUndefined();
+    expect(Object.keys(stats.compilation.assets)).toContain("image.copy.png");
+    expect(getErrors(stats)).toEqual([]);
+    expect(getWarnings(stats)).toEqual([]);
+  });
+
   it("should not rename a bundle no minimizer of its own would touch", async () => {
     /**
      * @param {boolean} withPlugin whether to apply the plugin
@@ -2350,6 +2423,215 @@ describe("deleting the asset a file was written beside", () => {
     expect(names).toContain("image.one.png");
     expect(names).toContain("image.two.png");
     expect(names).not.toContain("image.png");
+  });
+
+  it("should leave the source map of the asset it deleted", async () => {
+    const compiler = getCompiler({
+      devtool: "source-map",
+      entry: { one: path.resolve(__dirname, "./fixtures/entry.js") },
+    });
+
+    /**
+     * @param {{ [file: string]: string | Buffer }} input input
+     * @returns {{ code: string | Buffer }} the same bytes
+     */
+    const copy = (input) => ({ code: Object.values(input)[0] });
+
+    copy.getStage = (
+      /** @type {typeof import("webpack").Compilation} */ compilation,
+    ) => compilation.PROCESS_ASSETS_STAGE_OPTIMIZE_TRANSFER;
+
+    new MinimizerPlugin({
+      parallel: false,
+      test: /\.js$/i,
+      generate: {
+        implementation: copy,
+        type: "asset",
+        filename: "[path][base].gz",
+        deleteOriginalAssets: true,
+      },
+    }).apply(compiler);
+
+    const stats = await compile(compiler);
+
+    // The map is `related` to the asset that went, and webpack deletes what an
+    // asset's `related` names: the code it maps is served compressed, not gone.
+    expect(getErrors(stats)).toEqual([]);
+    expect(Object.keys(stats.compilation.assets).sort()).toEqual([
+      "one.js.gz",
+      "one.js.map",
+    ]);
+  });
+
+  it("should leave what another generator wrote beside it", async () => {
+    const compiler = getCompiler({
+      entry: { one: path.resolve(__dirname, "./fixtures/entry.js") },
+    });
+
+    /**
+     * @param {string} suffix what to name what it writes
+     * @param {EXPECTED_ANY} extra what else to say about it
+     * @returns {EXPECTED_ANY} one generator
+     */
+    const copyTo = (suffix, extra) => ({
+      implementation: (
+        /** @type {{ [file: string]: string | Buffer }} */ input,
+      ) => ({ code: Object.values(input)[0] }),
+      type: "asset",
+      filename: `[path][base]${suffix}`,
+      ...extra,
+    });
+
+    new MinimizerPlugin({
+      parallel: false,
+      test: /\.js$/i,
+      generate: {
+        br: copyTo(".br", { relatedName: "brotli" }),
+        gz: copyTo(".gz", { deleteOriginalAssets: true }),
+      },
+    }).apply(compiler);
+
+    const stats = await compile(compiler);
+
+    // The one deleting reads an original that names the other's file in its
+    // `related`, and that file is nothing to do with the deletion.
+    expect(getErrors(stats)).toEqual([]);
+    expect(Object.keys(stats.compilation.assets).sort()).toEqual([
+      "one.js.br",
+      "one.js.gz",
+    ]);
+  });
+
+  it("should ask a function which of them to delete", async () => {
+    const compiler = getCompiler({
+      entry: {
+        one: path.resolve(__dirname, "./fixtures/entry.js"),
+        two: path.resolve(__dirname, "./fixtures/entry.js"),
+      },
+    });
+
+    new MinimizerPlugin({
+      parallel: false,
+      test: /\.js$/i,
+      generate: {
+        implementation: (
+          /** @type {{ [file: string]: string | Buffer }} */ input,
+        ) => ({ code: Object.values(input)[0] }),
+        type: "asset",
+        filename: "[path][base].gz",
+        deleteOriginalAssets: (name) => name === "one.js",
+      },
+    }).apply(compiler);
+
+    const stats = await compile(compiler);
+
+    expect(getErrors(stats)).toEqual([]);
+    expect(Object.keys(stats.compilation.assets).sort()).toEqual([
+      "one.js.gz",
+      "two.js",
+      "two.js.gz",
+    ]);
+  });
+
+  it("should take a `filename` function for the name it writes", async () => {
+    const compiler = getCompiler({
+      entry: { one: path.resolve(__dirname, "./fixtures/entry.js") },
+    });
+
+    new MinimizerPlugin({
+      parallel: false,
+      test: /\.js$/i,
+      minify: [],
+      generate: {
+        implementation: (input) => ({ code: Object.values(input)[0] }),
+        type: "asset",
+        filename: (pathData) => `${pathData.filename}.gz`,
+      },
+    }).apply(compiler);
+
+    const stats = await compile(compiler);
+
+    expect(getErrors(stats)).toEqual([]);
+    expect(Object.keys(stats.compilation.assets).sort()).toEqual([
+      "one.js",
+      "one.js.gz",
+    ]);
+  });
+
+  it("should not point a file written under the original's name at itself", async () => {
+    const compiler = getCompiler({
+      entry: { one: path.resolve(__dirname, "./fixtures/entry.js") },
+    });
+
+    new MinimizerPlugin({
+      parallel: false,
+      test: /\.js$/i,
+      minify: [],
+      generate: {
+        implementation: (input) => ({
+          code: `/* generated */${Object.values(input)[0]}`,
+        }),
+        type: "asset",
+        filename: "[path][base]",
+        relatedName: "generated",
+      },
+    }).apply(compiler);
+
+    const stats = await compile(compiler);
+    const { info } = /** @type {import("webpack").Asset} */ (
+      stats.compilation.getAsset("one.js")
+    );
+
+    // Recording it would write the source back over what was just generated,
+    // and the file has nowhere to point but at itself.
+    expect(getErrors(stats)).toEqual([]);
+    expect(info.related).toBeUndefined();
+    expect(readAsset("one.js", compiler, stats)).toMatch(
+      /^\/\* generated \*\//,
+    );
+  });
+
+  it("should not delete what another generator wrote over the original", async () => {
+    const compiler = getCompiler({
+      entry: { one: path.resolve(__dirname, "./fixtures/entry.js") },
+    });
+
+    /**
+     * @param {string} mark what its output opens with
+     * @param {EXPECTED_ANY} extra what else to say about it
+     * @returns {EXPECTED_ANY} one generator
+     */
+    const marking = (mark, extra) => ({
+      implementation: (
+        /** @type {{ [file: string]: string | Buffer }} */ input,
+      ) => ({ code: `/* ${mark} */${Object.values(input)[0]}` }),
+      type: "asset",
+      ...extra,
+    });
+
+    new MinimizerPlugin({
+      parallel: false,
+      test: /\.js$/i,
+      minify: [],
+      generate: {
+        inPlace: marking("in place", { filename: "[path][base]" }),
+        beside: marking("beside", {
+          filename: "[path][base].gz",
+          deleteOriginalAssets: true,
+        }),
+      },
+    }).apply(compiler);
+
+    const stats = await compile(compiler);
+
+    // The generators run together, so the one deleting may reach the original
+    // after another has written over it — and what it holds is not what it read.
+    expect(getErrors(stats)).toEqual([]);
+    expect(Object.keys(stats.compilation.assets).sort()).toEqual([
+      "one.js",
+      "one.js.gz",
+    ]);
+    expect(readAsset("one.js", compiler, stats)).toMatch(/^\/\* in place \*\//);
   });
 
   it("should keep a file written under the original's own name", async () => {

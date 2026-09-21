@@ -1,6 +1,8 @@
 import fs from "fs";
 import path from "path";
 
+import del from "del";
+
 import MinimizerPlugin from "../src";
 import {
   cleanCssMinify,
@@ -1863,5 +1865,52 @@ describe("minify option written as an object", () => {
         ],
       }),
     ).toThrow(/`minify` sets its own `options`/);
+  });
+
+  it("should emit the same file wherever the minimizer's module sits", async () => {
+    const roots = path.resolve(__dirname, "./helpers/dist/checkouts");
+    const minimizer =
+      "module.exports = (input) => ({ code: Object.values(input)[0] });\n";
+    const entry = 'export default "one";\n';
+
+    /**
+     * @param {string} root a checkout of the same two files
+     * @param {string} named how the minimizer's module is spelled
+     * @returns {Promise<string[]>} the names it emitted
+     */
+    const namesFrom = async (root, named = "mini.js") => {
+      const context = path.join(roots, root, "src");
+
+      fs.mkdirSync(context, { recursive: true });
+      fs.writeFileSync(path.join(roots, root, "mini.js"), minimizer);
+      fs.writeFileSync(path.join(context, "entry.js"), entry);
+
+      const compiler = getCompiler({
+        context,
+        entry: "./entry.js",
+        output: {
+          path: path.resolve(__dirname, "./dist-terser"),
+          filename: "[name].[fullhash].js",
+        },
+      });
+
+      new MinimizerPlugin({
+        minify: path.join(roots, root, named),
+      }).apply(compiler);
+
+      return Object.keys((await compile(compiler)).compilation.assets);
+    };
+
+    // The same minimizer, in the same place relative to the build, under two
+    // different roots: what is emitted cannot vary with where the checkout is.
+    expect(await namesFrom("one")).toStrictEqual(await namesFrom("two"));
+
+    // And one module named two ways is still one module, which only the file
+    // `require` would reach says.
+    expect(await namesFrom("one", "mini")).toStrictEqual(
+      await namesFrom("one", "mini.js"),
+    );
+
+    await del(roots);
   });
 });

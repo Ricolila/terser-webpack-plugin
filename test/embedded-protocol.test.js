@@ -1,7 +1,7 @@
 import path from "path";
 
 import MinimizerPlugin from "../src";
-import { asFunction, functionBody } from "../src/utils";
+import { asFunction, asRule, functionBody, ruleBody } from "../src/utils";
 
 import {
   compile,
@@ -10,6 +10,10 @@ import {
   getWarnings,
   readAsset,
 } from "./helpers";
+import { RUN_CSS_TESTS } from "./helpers/env";
+
+// The CSS minimizers need what `RUN_CSS_TESTS` says, like `css-minify-option`.
+const describeIf = (condition) => (condition ? describe : describe.skip);
 
 // The `renderEmbeddedSource` dispatch on its own: a minimizer hands out what it
 // nests, each body goes to whichever minimizer claims its language, and the
@@ -333,6 +337,40 @@ async function brokenHandlerMinify(input, sourceMap, minimizerOptions) {
     ...answerDiagnostics([rendered]),
   };
 }
+
+/**
+ * A declaration list, what an HTML `style=""` holds: no stylesheet production
+ * reads it, so a minimizer handed it as one drops or mangles it.
+ */
+const STYLE_ATTRIBUTE_BODY = "  color :  red ;  margin : 0px  ";
+
+/**
+ * A document minifier handing out one `style=""` body as the block's contents.
+ * @param {{ [file: string]: string }} input a single `{ filename: code }` entry
+ * @param {undefined} sourceMap unused
+ * @param {{ renderEmbeddedSource: (source: string, info: { type: string, as?: string }) => Promise<EXPECTED_ANY> }} minimizerOptions minimizer options
+ * @returns {Promise<EXPECTED_ANY>} the body as its minimizer wrote it
+ */
+async function styleAttributeMinify(input, sourceMap, minimizerOptions) {
+  const rendered = await askRenderer(
+    minimizerOptions.renderEmbeddedSource,
+    STYLE_ATTRIBUTE_BODY,
+    "css",
+    "block-contents",
+  );
+  const text = answerText(rendered);
+
+  return {
+    code: typeof text === "string" ? text : STYLE_ATTRIBUTE_BODY,
+    ...answerDiagnostics([rendered]),
+  };
+}
+
+styleAttributeMinify.getTypes = () => ["page"];
+styleAttributeMinify.getEmbeddedTypes = () => ["css"];
+styleAttributeMinify.supportsWorker = () => false;
+styleAttributeMinify.supportsWorkerThreads = () => false;
+styleAttributeMinify.filter = (name) => /\.page$/i.test(name);
 
 brokenHandlerMinify.getTypes = () => ["page"];
 brokenHandlerMinify.getEmbeddedTypes = () => ["javascript"];
@@ -822,6 +860,171 @@ describe("a handler body a minimizer does not answer with the function", () => {
     expect(getErrors(stats)).toHaveLength(1);
     expect(stats.compilation.getAsset("host.page").source.source()).toBe(
       BROKEN_HANDLER_BODY,
+    );
+  });
+});
+
+// csso and clean-css are plain JavaScript and run on every row; the rest need
+// what `RUN_CSS_TESTS` says. Asserted rather than snapshotted, since a
+// snapshot in a skipped block is reported obsolete (see `jest.config.js`).
+const PORTABLE_CSS_MINIMIZERS = [
+  ["cssoMinify", MinimizerPlugin.cssoMinify],
+  ["cleanCssMinify", MinimizerPlugin.cleanCssMinify],
+];
+const MODERN_CSS_MINIMIZERS = [
+  ["cssnanoMinify", MinimizerPlugin.cssnanoMinify],
+  ["esbuildMinifyCss", MinimizerPlugin.esbuildMinifyCss],
+  ["lightningCssMinify", MinimizerPlugin.lightningCssMinify],
+  ["swcMinifyCss", MinimizerPlugin.swcMinifyCss],
+];
+
+/**
+ * @param {EXPECTED_ANY} minifier a CSS minify function
+ * @returns {Promise<void>} resolves once the page is checked
+ */
+const expectStyleAttributeMinified = async (minifier) => {
+  const compiler = getPageCompiler([styleAttributeMinify, minifier]);
+  const stats = await compile(compiler);
+
+  expect(getErrors(stats)).toEqual([]);
+  expect(readAsset("host.page", compiler, stats)).toBe("color:red;margin:0");
+};
+
+describe("a body handed out as a block's contents", () => {
+  it.each(PORTABLE_CSS_MINIMIZERS)(
+    "is minified as the rule it belongs to by `%s`",
+    async (name, minifier) => {
+      await expectStyleAttributeMinified(minifier);
+    },
+  );
+
+  describeIf(RUN_CSS_TESTS)("where the CSS minimizers run", () => {
+    it.each(MODERN_CSS_MINIMIZERS)(
+      "is minified as the rule it belongs to by `%s`",
+      async (name, minifier) => {
+        await expectStyleAttributeMinified(minifier);
+      },
+    );
+  });
+});
+
+describe("the rule a block's contents are minified inside", () => {
+  it("makes the contents a whole stylesheet an engine can read", () => {
+    // The newline ends a bad string the contents may close with.
+    expect(asRule("color:red")).toBe("a{color:red\n}");
+  });
+
+  it("reads the contents back out of what a minimizer answered", () => {
+    expect(ruleBody("a{color:red}")).toBe("color:red");
+    expect(ruleBody("a {\n  color: red;\n}\n")).toBe("color: red;");
+    // A minimizer drops a rule left with no declarations.
+    expect(ruleBody("")).toBe("");
+  });
+
+  it("reads past a brace a string or a comment holds", () => {
+    expect(ruleBody('a{content:"{"}')).toBe('content:"{"');
+    expect(ruleBody("a{content:'}'}")).toBe("content:'}'");
+    expect(ruleBody('a{content:"\\"}"}')).toBe('content:"\\"}"');
+    expect(ruleBody("a{/* } */color:red}")).toBe("/* } */color:red");
+    // An escaped brace is part of an identifier, not a block's edge.
+    expect(ruleBody("a{--x\\}:1}")).toBe("--x\\}:1");
+    // A custom property's value may hold a block of its own.
+    expect(ruleBody("a{--x:{a:b};color:red}")).toBe("--x:{a:b};color:red");
+  });
+
+  it("declines an answer that is not that one rule", () => {
+    expect(ruleBody("color:red")).toBeUndefined();
+    expect(ruleBody("a{color:red}b{color:blue}")).toBeUndefined();
+    expect(ruleBody("a{--x:{a:b}}b{color:blue}")).toBeUndefined();
+    expect(ruleBody("a{--x:{a:b}")).toBeUndefined();
+    expect(ruleBody("b{color:red}")).toBeUndefined();
+    expect(ruleBody("@media print{a{color:red}}")).toBeUndefined();
+    expect(ruleBody(undefined)).toBeUndefined();
+    expect(ruleBody('a{content:"{"}b{color:blue}')).toBeUndefined();
+    expect(ruleBody("a{color:red")).toBeUndefined();
+    // A string or a comment left open reaches past the brace closing the rule.
+    expect(ruleBody('a{content:"}')).toBeUndefined();
+    expect(ruleBody("a{color:red/*}")).toBeUndefined();
+  });
+});
+
+/**
+ * @param {EXPECTED_ANY} minifier a CSS minify function
+ * @param {Record<string, boolean>} mapOptions how it spells asking for a map
+ * @returns {Promise<void>} resolves once the answer is checked
+ */
+const expectNoMapForWrappedBody = async (minifier, mapOptions) => {
+  // The wrap moves every position, so a map asked for by the options too
+  // would describe a stylesheet that is not what comes back.
+  const result = await minifier(
+    { "style.css": "  color :  red  " },
+    { version: 3, sources: [], names: [], mappings: "" },
+    { as: "block-contents", ...mapOptions },
+  );
+
+  expect(result.code).toBe("color:red");
+  expect(result.map).toBeUndefined();
+};
+
+describe("a CSS minimizer handed a block's contents directly", () => {
+  it("minifies a string holding a brace", async () => {
+    const result = await MinimizerPlugin.cssoMinify(
+      { "style.css": '  content :  "{"  ' },
+      undefined,
+      { as: "block-contents" },
+    );
+
+    expect(result.code).toBe('content:"{"');
+  });
+
+  it.each([
+    ["cssoMinify", MinimizerPlugin.cssoMinify, { sourceMap: true }],
+    ["cleanCssMinify", MinimizerPlugin.cleanCssMinify, { sourceMap: true }],
+  ])(
+    "returns no map for the rule `%s` minified it inside",
+    async (name, minifier, mapOptions) => {
+      await expectNoMapForWrappedBody(minifier, mapOptions);
+    },
+  );
+
+  describeIf(RUN_CSS_TESTS)("where the CSS minimizers run", () => {
+    it("leaves the options it was handed as they were", async () => {
+      const options = { as: "block-contents" };
+      const input = { "style.css": "  color :  red  " };
+
+      const first = await MinimizerPlugin.esbuildMinifyCss(
+        input,
+        undefined,
+        options,
+      );
+      const second = await MinimizerPlugin.esbuildMinifyCss(
+        input,
+        undefined,
+        options,
+      );
+
+      expect(options).toEqual({ as: "block-contents" });
+      expect(first.code).toBe("color:red");
+      expect(second.code).toBe("color:red");
+    });
+
+    it.each([
+      [
+        "esbuildMinifyCss",
+        MinimizerPlugin.esbuildMinifyCss,
+        { sourcemap: true },
+      ],
+      [
+        "lightningCssMinify",
+        MinimizerPlugin.lightningCssMinify,
+        { sourceMap: true },
+      ],
+      ["swcMinifyCss", MinimizerPlugin.swcMinifyCss, { sourceMap: true }],
+    ])(
+      "returns no map for the rule `%s` minified it inside",
+      async (name, minifier, mapOptions) => {
+        await expectNoMapForWrappedBody(minifier, mapOptions);
+      },
     );
   });
 });

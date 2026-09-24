@@ -445,7 +445,9 @@ class MinimizerPlugin {
             })
           );
     const test =
-      typeof declaredTest !== "undefined" ? declaredTest : /\.[cm]?js(\?.*)?$/i;
+      typeof declaredTest !== "undefined"
+        ? declaredTest
+        : /^[^?#]*\.[cm]?js(?:[?#].*)?$/i;
 
     // `terserOptions` is a deprecated alias of `minimizerOptions`; prefer the
     // new name when both are provided.
@@ -987,9 +989,9 @@ class MinimizerPlugin {
 
           if (typeof info.javascriptModule !== "undefined") {
             options.module = info.javascriptModule;
-          } else if (/\.mjs(\?.*)?$/i.test(name)) {
+          } else if (/^[^?#]*\.mjs(?:[?#].*)?$/i.test(name)) {
             options.module = true;
-          } else if (/\.cjs(\?.*)?$/i.test(name)) {
+          } else if (/^[^?#]*\.cjs(?:[?#].*)?$/i.test(name)) {
             options.module = false;
           }
 
@@ -1108,11 +1110,21 @@ class MinimizerPlugin {
             let query = "";
             let filename = name;
 
-            const querySplit = filename.indexOf("?");
+            // A fragment is no part of the file on disk, so neither `filename`,
+            // `query` nor a name built from them may carry one.
+            const suffixSplit = filename.search(/[?#]/);
 
-            if (querySplit >= 0) {
-              query = filename.slice(querySplit);
-              filename = filename.slice(0, querySplit);
+            if (suffixSplit >= 0) {
+              if (filename[suffixSplit] === "?") {
+                const fragmentSplit = filename.indexOf("#", suffixSplit);
+
+                query = filename.slice(
+                  suffixSplit,
+                  fragmentSplit >= 0 ? fragmentSplit : undefined,
+                );
+              }
+
+              filename = filename.slice(0, suffixSplit);
             }
 
             const lastSlashIndex = filename.lastIndexOf("/");

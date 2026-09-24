@@ -692,4 +692,47 @@ describe("extractComments option", () => {
     expect(getErrors(stats)).toMatchSnapshot("errors");
     expect(getWarnings(stats)).toMatchSnapshot("warnings");
   });
+
+  it.each([
+    ["the default filename", undefined, "", ""],
+    ["a function filename", createFilenameFn(), "", ""],
+    // `[query]` reads the `filename` handed to it, which carries none.
+    ["the default filename and a query", undefined, "?v=1", ""],
+    ["a function filename and a query", createFilenameFn(), "?v=1", "?v=1"],
+  ])(
+    "should keep a fragment out of the extracted comments file with %s",
+    async (_, filename, query, licenseQuery) => {
+      compiler = getCompiler({
+        entry: path.resolve(__dirname, "./fixtures/comments.js"),
+        output: {
+          path: path.resolve(__dirname, "./dist"),
+          filename: `[name].js${query}#[fullhash]`,
+          chunkFilename: `[id].js${query}#[fullhash]`,
+        },
+      });
+
+      new MinimizerPlugin({
+        extractComments: filename ? { filename } : true,
+      }).apply(compiler);
+
+      const stats = await compile(compiler);
+      const names = Object.keys(stats.compilation.assets);
+
+      // Written as `main.js.LICENSE.txt`, not onto `main.js` with the bundle.
+      expect(names).toEqual(
+        expect.arrayContaining([
+          `main.js.LICENSE.txt${licenseQuery}`,
+          `203.js.LICENSE.txt${licenseQuery}`,
+        ]),
+      );
+      expect(names.filter((name) => name.includes("LICENSE"))).toHaveLength(2);
+      expect(readAsset("main.js#x", compiler, stats)).toMatch(
+        new RegExp(
+          `^/\\*! For license information please see main\\.js\\.LICENSE\\.txt${licenseQuery.replace("?", "\\?")} \\*/`,
+        ),
+      );
+      expect(getErrors(stats)).toEqual([]);
+      expect(getWarnings(stats)).toEqual([]);
+    },
+  );
 });
